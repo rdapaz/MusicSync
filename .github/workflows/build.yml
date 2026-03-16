@@ -12,23 +12,28 @@ permissions:
 jobs:
   build:
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
             goos: linux
             goarch: amd64
+            cc: gcc
             artifact: musicsync-linux-amd64
           - os: macos-latest
             goos: darwin
             goarch: amd64
+            cc: clang -arch x86_64
             artifact: musicsync-darwin-amd64
           - os: macos-latest
             goos: darwin
             goarch: arm64
+            cc: clang
             artifact: musicsync-darwin-arm64
           - os: windows-latest
             goos: windows
             goarch: amd64
+            cc: gcc
             artifact: musicsync-windows-amd64.exe
 
     runs-on: ${{ matrix.os }}
@@ -50,6 +55,8 @@ jobs:
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 1
+          CC: ${{ matrix.cc }}
         run: go build -trimpath -ldflags="-s -w" -o ${{ matrix.artifact }} .
 
       - name: Upload artifact
