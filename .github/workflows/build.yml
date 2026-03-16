@@ -48,6 +48,9 @@ jobs:
         with:
           go-version: stable
 
+      - name: Update go.mod for toolchain
+        run: go mod tidy
+
       - name: Install Linux dependencies
         if: matrix.goos == 'linux'
         run: |
