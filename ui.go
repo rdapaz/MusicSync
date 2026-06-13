@@ -6,6 +6,8 @@ import (
 	"os/exec"
 	"runtime"
 	"strings"
+	"sync/atomic"
+	"time"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/canvas"
@@ -42,23 +44,6 @@ func buildUI(a fyne.App, w fyne.Window) fyne.CanvasObject {
 	savePrefs := func() {
 		prefs.SetString("source_dirs", strings.Join(sourceDirs, "\n"))
 	}
-
-	// persistSelection saves the current track selection to the cache so an
-	// interrupted run can restore it on the next scan/load. Called on the main
-	// (UI) goroutine, so no locking is needed around the model read.
-	persistSelection := func(paths []string) {
-		if err := SaveSelection(paths); err != nil {
-			fmt.Printf("Warning: failed to save selection: %v\n", err)
-		}
-	}
-
-	// Save the selection on a graceful close too (e.g. quitting before a copy).
-	w.SetCloseIntercept(func() {
-		if model != nil {
-			persistSelection(model.SelectedPaths())
-		}
-		w.Close()
-	})
 
 	// -----------------------------------------------------------------------
 	// Source directory list
@@ -392,6 +377,111 @@ func buildUI(a fyne.App, w fyne.Window) fyne.CanvasObject {
 	cancelBtn.Disable()
 
 	// -----------------------------------------------------------------------
+	// Named collections — save/restore sets of picked tracks
+	// -----------------------------------------------------------------------
+	collectionSelect := widget.NewSelect(nil, nil)
+	collectionSelect.PlaceHolder = "‹no saved collections›"
+
+	refreshCollections := func() {
+		names, err := ListCollections()
+		if err != nil {
+			fmt.Printf("Warning: failed to list collections: %v\n", err)
+		}
+		prev := collectionSelect.Selected
+		collectionSelect.Options = names
+		found := false
+		for _, n := range names {
+			if n == prev {
+				found = true
+				break
+			}
+		}
+		if !found {
+			collectionSelect.ClearSelected()
+		}
+		collectionSelect.Refresh()
+	}
+
+	saveColBtn := widget.NewButtonWithIcon("Save As…", theme.DocumentSaveIcon(), func() {
+		if model == nil {
+			return
+		}
+		paths := model.SelectedPaths()
+		if len(paths) == 0 {
+			dialog.ShowError(fmt.Errorf("no tracks selected to save"), w)
+			return
+		}
+		nameEntry := widget.NewEntry()
+		nameEntry.SetPlaceHolder("e.g. Road trip")
+		if collectionSelect.Selected != "" {
+			nameEntry.SetText(collectionSelect.Selected)
+		}
+		dialog.ShowForm("Save Collection", "Save", "Cancel",
+			[]*widget.FormItem{widget.NewFormItem("Name", nameEntry)},
+			func(ok bool) {
+				if !ok {
+					return
+				}
+				name := strings.TrimSpace(nameEntry.Text)
+				if name == "" {
+					dialog.ShowError(fmt.Errorf("collection name cannot be empty"), w)
+					return
+				}
+				if err := SaveCollection(name, paths); err != nil {
+					dialog.ShowError(fmt.Errorf("save failed: %w", err), w)
+					return
+				}
+				refreshCollections()
+				collectionSelect.SetSelected(name)
+			}, w)
+	})
+
+	loadColBtn := widget.NewButtonWithIcon("Load", theme.FolderOpenIcon(), func() {
+		if model == nil {
+			return
+		}
+		name := collectionSelect.Selected
+		if name == "" {
+			dialog.ShowError(fmt.Errorf("pick a collection to load"), w)
+			return
+		}
+		paths, err := LoadCollection(name)
+		if err != nil {
+			dialog.ShowError(fmt.Errorf("load failed: %w", err), w)
+			return
+		}
+		model.DeselectAll()
+		n := model.RestoreSelection(paths)
+		if tree != nil {
+			tree.Refresh()
+		}
+		updateBudget()
+		progressLabel.Show()
+		progressLabel.SetText(fmt.Sprintf("Loaded collection %q — %d tracks selected", name, n))
+	})
+
+	deleteColBtn := widget.NewButtonWithIcon("Delete", theme.DeleteIcon(), func() {
+		name := collectionSelect.Selected
+		if name == "" {
+			return
+		}
+		dialog.ShowConfirm("Delete Collection", fmt.Sprintf("Delete saved collection %q?", name), func(ok bool) {
+			if !ok {
+				return
+			}
+			if err := DeleteCollection(name); err != nil {
+				dialog.ShowError(fmt.Errorf("delete failed: %w", err), w)
+				return
+			}
+			refreshCollections()
+		}, w)
+	})
+
+	saveColBtn.Disable()
+	loadColBtn.Disable()
+	refreshCollections() // populate dropdown at startup
+
+	// -----------------------------------------------------------------------
 	// Tree widget creation
 	// -----------------------------------------------------------------------
 	tree = widget.NewTree(
@@ -468,13 +558,6 @@ func buildUI(a fyne.App, w fyne.Window) fyne.CanvasObject {
 			updateBudget()
 		})
 
-		// Restore a previously saved selection so an interrupted run resumes
-		// without re-picking everything.
-		restoredCount := 0
-		if saved, _ := LoadSelection(); len(saved) > 0 {
-			restoredCount = model.RestoreSelection(saved)
-		}
-
 		tree.Refresh()
 		progressBar.Hide()
 		source := "scanned"
@@ -487,15 +570,9 @@ func buildUI(a fyne.App, w fyne.Window) fyne.CanvasObject {
 
 		detailTitle.Text = "Library Ready"
 		detailTitle.Refresh()
-		if restoredCount > 0 {
-			detailSubtitle.SetText(fmt.Sprintf(
-				"%d tracks found across %d artists.\nRestored your previous selection of %d tracks — review and click Copy, or Deselect All to start fresh.",
-				len(lib.Tracks), countArtists(lib), restoredCount))
-		} else {
-			detailSubtitle.SetText(fmt.Sprintf(
-				"%d tracks found across %d artists.\nSelect albums and tracks, then click Copy.",
-				len(lib.Tracks), countArtists(lib)))
-		}
+		detailSubtitle.SetText(fmt.Sprintf(
+			"%d tracks found across %d artists.\nSelect albums and tracks, then click Copy.",
+			len(lib.Tracks), countArtists(lib)))
 		detailContent.Segments = nil
 		detailContent.Refresh()
 
@@ -503,6 +580,9 @@ func buildUI(a fyne.App, w fyne.Window) fyne.CanvasObject {
 		selectAllBtn.Enable()
 		deselectAllBtn.Enable()
 		copyBtn.Enable()
+		saveColBtn.Enable()
+		loadColBtn.Enable()
+		refreshCollections()
 		updateBudget()
 	}
 
@@ -631,8 +711,12 @@ func buildUI(a fyne.App, w fyne.Window) fyne.CanvasObject {
 				return
 			}
 
-			// Persist the selection so this copy can be resumed if interrupted.
-			persistSelection(model.SelectedPaths())
+			// Auto-save the picks under the reserved "Last copy" collection so
+			// an interrupted run can be reloaded from the Collections dropdown.
+			if err := SaveCollection(LastCopyCollection, model.SelectedPaths()); err != nil {
+				fmt.Printf("Warning: failed to auto-save selection: %v\n", err)
+			}
+			refreshCollections()
 
 			scanBtn.Disable()
 			selectAllBtn.Disable()
@@ -654,22 +738,40 @@ func buildUI(a fyne.App, w fyne.Window) fyne.CanvasObject {
 				}()
 
 				workers := workerCount
+				copyStart := time.Now()
+				var lastBytes atomic.Int64
 				okN, skipN, failN, err := CopyTracks(ctx, tracks, dst, workers, func(p CopyProgress) {
+					lastBytes.Store(p.BytesDone)
 					if p.FilesTotal > 0 {
 						progressBar.SetValue(float64(p.FilesDone) / float64(p.FilesTotal))
 					}
-					progressLabel.SetText(fmt.Sprintf("Copying %d/%d  |  %s  |  %s",
-						p.FilesDone, p.FilesTotal, FormatSize(p.BytesDone), p.CurrentFile))
+					elapsed := time.Since(copyStart)
+					rate := bytesPerSec(p.BytesDone, elapsed)
+					label := fmt.Sprintf("Copying %d/%d  •  %s / %s  •  %s  •  elapsed %s",
+						p.FilesDone, p.FilesTotal,
+						FormatSize(p.BytesDone), FormatSize(p.BytesTotal),
+						FormatRate(rate), FormatDuration(elapsed))
+					if rate > 0 && p.BytesTotal > p.BytesDone {
+						eta := time.Duration(float64(p.BytesTotal-p.BytesDone) / rate * float64(time.Second))
+						label += "  •  ETA " + FormatDuration(eta)
+					}
+					if p.CurrentFile != "" {
+						label += "  •  " + p.CurrentFile
+					}
+					progressLabel.SetText(label)
 				})
 
+				elapsed := time.Since(copyStart)
 				progressBar.Hide()
 
 				if err != nil && ctx.Err() != nil {
-					progressLabel.SetText("Copy cancelled.")
+					progressLabel.SetText(fmt.Sprintf("Copy cancelled after %s.", FormatDuration(elapsed)))
 				} else {
-					progressLabel.SetText(fmt.Sprintf("Done: %d copied, %d skipped, %d failed", okN, skipN, failN))
-					summary := fmt.Sprintf("Copy complete!\n\nCopied: %d\nSkipped: %d\nFailed: %d",
-						okN, skipN, failN)
+					avg := bytesPerSec(lastBytes.Load(), elapsed)
+					progressLabel.SetText(fmt.Sprintf("Done: %d copied, %d skipped, %d failed  •  %s in %s (avg %s)",
+						okN, skipN, failN, FormatSize(lastBytes.Load()), FormatDuration(elapsed), FormatRate(avg)))
+					summary := fmt.Sprintf("Copy complete!\n\nCopied: %d\nSkipped: %d\nFailed: %d\n\nTransferred %s in %s\nAverage rate: %s",
+						okN, skipN, failN, FormatSize(lastBytes.Load()), FormatDuration(elapsed), FormatRate(avg))
 					dialog.ShowInformation("Copy Complete", summary, w)
 				}
 
@@ -733,9 +835,18 @@ func buildUI(a fyne.App, w fyne.Window) fyne.CanvasObject {
 		copyBtn,
 	)
 
+	collectionsRow := container.NewHBox(
+		widget.NewLabel("Collection:"),
+		collectionSelect,
+		saveColBtn,
+		loadColBtn,
+		deleteColBtn,
+	)
+
 	statusBar := container.NewVBox(
 		widget.NewSeparator(),
 		budgetRow,
+		collectionsRow,
 		buttonRow,
 	)
 

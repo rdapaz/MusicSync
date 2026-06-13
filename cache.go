@@ -58,8 +58,10 @@ func openCacheDB() (*sql.DB, error) {
 			bucket       TEXT,
 			album_key    TEXT
 		);
-		CREATE TABLE IF NOT EXISTS selection (
-			src_path TEXT PRIMARY KEY
+		CREATE TABLE IF NOT EXISTS collections (
+			name     TEXT NOT NULL,
+			src_path TEXT NOT NULL,
+			PRIMARY KEY (name, src_path)
 		);
 	`); err != nil {
 		db.Close()
@@ -199,13 +201,20 @@ func dirsMatch(a, b []string) bool {
 }
 
 // ---------------------------------------------------------------------------
-// Selection persistence — remembers which tracks were checked so an
-// interrupted run can be resumed without re-selecting everything.
+// Named collections — save and restore multiple named sets of picked tracks,
+// so a run can be resumed (or a saved set re-used) after an interruption.
 // ---------------------------------------------------------------------------
 
-// SaveSelection replaces the saved selection with the given source paths.
-// An empty slice clears the saved selection.
-func SaveSelection(srcPaths []string) error {
+// LastCopyCollection is the reserved name under which the current selection is
+// auto-saved when a copy starts, so an interrupted run can be reloaded.
+const LastCopyCollection = "Last copy"
+
+// SaveCollection replaces the named collection with the given source paths.
+func SaveCollection(name string, srcPaths []string) error {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return fmt.Errorf("collection name is empty")
+	}
 	db, err := openCacheDB()
 	if err != nil {
 		return err
@@ -218,42 +227,33 @@ func SaveSelection(srcPaths []string) error {
 	}
 	defer tx.Rollback()
 
-	if _, err := tx.Exec("DELETE FROM selection"); err != nil {
+	if _, err := tx.Exec("DELETE FROM collections WHERE name = ?", name); err != nil {
 		return err
 	}
-	stmt, err := tx.Prepare("INSERT OR IGNORE INTO selection (src_path) VALUES (?)")
+	stmt, err := tx.Prepare("INSERT OR IGNORE INTO collections (name, src_path) VALUES (?, ?)")
 	if err != nil {
 		return err
 	}
 	defer stmt.Close()
 	for _, p := range srcPaths {
-		if _, err := stmt.Exec(p); err != nil {
+		if _, err := stmt.Exec(name, p); err != nil {
 			return err
 		}
 	}
 	return tx.Commit()
 }
 
-// LoadSelection returns the previously saved selection as a set of source paths.
-// Returns nil if there is no cache or no saved selection.
-func LoadSelection() (map[string]bool, error) {
-	dbPath, err := cacheDBPath()
-	if err != nil {
-		return nil, nil
-	}
-	if _, err := os.Stat(dbPath); err != nil {
-		return nil, nil // no cache file
-	}
-
+// LoadCollection returns the source paths of a named collection as a set.
+func LoadCollection(name string) (map[string]bool, error) {
 	db, err := openCacheDB()
 	if err != nil {
-		return nil, nil
+		return nil, err
 	}
 	defer db.Close()
 
-	rows, err := db.Query("SELECT src_path FROM selection")
+	rows, err := db.Query("SELECT src_path FROM collections WHERE name = ?", name)
 	if err != nil {
-		return nil, nil
+		return nil, err
 	}
 	defer rows.Close()
 
@@ -261,12 +261,54 @@ func LoadSelection() (map[string]bool, error) {
 	for rows.Next() {
 		var p string
 		if err := rows.Scan(&p); err != nil {
-			return nil, nil
+			return nil, err
 		}
 		paths[p] = true
 	}
-	if len(paths) == 0 {
+	return paths, nil
+}
+
+// ListCollections returns the saved collection names, sorted. It does not
+// create the cache DB if none exists yet (returns an empty list instead).
+func ListCollections() ([]string, error) {
+	dbPath, err := cacheDBPath()
+	if err != nil {
 		return nil, nil
 	}
-	return paths, nil
+	if _, err := os.Stat(dbPath); err != nil {
+		return nil, nil // no cache yet
+	}
+
+	db, err := openCacheDB()
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+
+	rows, err := db.Query("SELECT DISTINCT name FROM collections ORDER BY name")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var names []string
+	for rows.Next() {
+		var n string
+		if err := rows.Scan(&n); err != nil {
+			return nil, err
+		}
+		names = append(names, n)
+	}
+	return names, nil
+}
+
+// DeleteCollection removes a named collection.
+func DeleteCollection(name string) error {
+	db, err := openCacheDB()
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	_, err = db.Exec("DELETE FROM collections WHERE name = ?", name)
+	return err
 }

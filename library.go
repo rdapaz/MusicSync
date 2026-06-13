@@ -627,3 +627,35 @@ func FormatSize(bytes int64) string {
 		return fmt.Sprintf("%d B", bytes)
 	}
 }
+
+// bytesPerSec returns the average rate in bytes/second over the elapsed time.
+func bytesPerSec(bytes int64, d time.Duration) float64 {
+	s := d.Seconds()
+	if s <= 0 {
+		return 0
+	}
+	return float64(bytes) / s
+}
+
+// FormatRate returns a human-readable transfer rate (e.g. "18.4 MiB/s").
+func FormatRate(bytesPerSecond float64) string {
+	if bytesPerSecond <= 0 {
+		return "0 B/s"
+	}
+	return FormatSize(int64(bytesPerSecond)) + "/s"
+}
+
+// FormatDuration returns a compact M:SS or H:MM:SS duration string.
+func FormatDuration(d time.Duration) string {
+	if d < 0 {
+		d = 0
+	}
+	total := int(d.Seconds())
+	h := total / 3600
+	m := (total % 3600) / 60
+	s := total % 60
+	if h > 0 {
+		return fmt.Sprintf("%d:%02d:%02d", h, m, s)
+	}
+	return fmt.Sprintf("%d:%02d", m, s)
+}
