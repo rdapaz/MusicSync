@@ -43,6 +43,23 @@ func buildUI(a fyne.App, w fyne.Window) fyne.CanvasObject {
 		prefs.SetString("source_dirs", strings.Join(sourceDirs, "\n"))
 	}
 
+	// persistSelection saves the current track selection to the cache so an
+	// interrupted run can restore it on the next scan/load. Called on the main
+	// (UI) goroutine, so no locking is needed around the model read.
+	persistSelection := func(paths []string) {
+		if err := SaveSelection(paths); err != nil {
+			fmt.Printf("Warning: failed to save selection: %v\n", err)
+		}
+	}
+
+	// Save the selection on a graceful close too (e.g. quitting before a copy).
+	w.SetCloseIntercept(func() {
+		if model != nil {
+			persistSelection(model.SelectedPaths())
+		}
+		w.Close()
+	})
+
 	// -----------------------------------------------------------------------
 	// Source directory list
 	// -----------------------------------------------------------------------
@@ -134,10 +151,13 @@ func buildUI(a fyne.App, w fyne.Window) fyne.CanvasObject {
 	for i := 1; i <= numCPU; i++ {
 		workerOptions = append(workerOptions, fmt.Sprintf("%d", i))
 	}
-	workerCount := numCPU
+	// Default to 1 for the COPY phase: a micro-SD card is a single-channel
+	// sequential-write device, so concurrent writers cause FTL thrashing and
+	// write amplification — more workers make the copy slower, not faster.
+	workerCount := 1
 
 	workerSelect := widget.NewSelect(workerOptions, nil)
-	workerSelect.SetSelected(fmt.Sprintf("%d", numCPU))
+	workerSelect.SetSelected("1")
 
 	usableBytes := func() int64 {
 		nominal := int64(budgetGB * 1_000_000_000)
@@ -448,6 +468,13 @@ func buildUI(a fyne.App, w fyne.Window) fyne.CanvasObject {
 			updateBudget()
 		})
 
+		// Restore a previously saved selection so an interrupted run resumes
+		// without re-picking everything.
+		restoredCount := 0
+		if saved, _ := LoadSelection(); len(saved) > 0 {
+			restoredCount = model.RestoreSelection(saved)
+		}
+
 		tree.Refresh()
 		progressBar.Hide()
 		source := "scanned"
@@ -460,9 +487,15 @@ func buildUI(a fyne.App, w fyne.Window) fyne.CanvasObject {
 
 		detailTitle.Text = "Library Ready"
 		detailTitle.Refresh()
-		detailSubtitle.SetText(fmt.Sprintf(
-			"%d tracks found across %d artists.\nSelect albums and tracks, then click Copy.",
-			len(lib.Tracks), countArtists(lib)))
+		if restoredCount > 0 {
+			detailSubtitle.SetText(fmt.Sprintf(
+				"%d tracks found across %d artists.\nRestored your previous selection of %d tracks — review and click Copy, or Deselect All to start fresh.",
+				len(lib.Tracks), countArtists(lib), restoredCount))
+		} else {
+			detailSubtitle.SetText(fmt.Sprintf(
+				"%d tracks found across %d artists.\nSelect albums and tracks, then click Copy.",
+				len(lib.Tracks), countArtists(lib)))
+		}
 		detailContent.Segments = nil
 		detailContent.Refresh()
 
@@ -523,8 +556,10 @@ func buildUI(a fyne.App, w fyne.Window) fyne.CanvasObject {
 			progressLabel.SetText(fmt.Sprintf("Probing %d files...", len(paths)))
 			progressBar.SetValue(0)
 
-			workers := workerCount
-			newLib, err := ProbeFiles(ctx, paths, "ffprobe", workers*2, func(done, total int) {
+			// Probing is CPU/IO-bound on many tiny metadata reads; high
+			// concurrency helps here (unlike the copy phase), so it is fixed and
+			// independent of the Workers control, which now governs copy only.
+			newLib, err := ProbeFiles(ctx, paths, "ffprobe", numCPU*2, func(done, total int) {
 				if total > 0 {
 					progressBar.SetValue(float64(done) / float64(total))
 				}
@@ -595,6 +630,9 @@ func buildUI(a fyne.App, w fyne.Window) fyne.CanvasObject {
 			if !ok {
 				return
 			}
+
+			// Persist the selection so this copy can be resumed if interrupted.
+			persistSelection(model.SelectedPaths())
 
 			scanBtn.Disable()
 			selectAllBtn.Disable()

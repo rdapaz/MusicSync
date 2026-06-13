@@ -58,6 +58,9 @@ func openCacheDB() (*sql.DB, error) {
 			bucket       TEXT,
 			album_key    TEXT
 		);
+		CREATE TABLE IF NOT EXISTS selection (
+			src_path TEXT PRIMARY KEY
+		);
 	`); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("init schema: %w", err)
@@ -193,4 +196,77 @@ func dirsMatch(a, b []string) bool {
 	sort.Strings(sa)
 	sort.Strings(sb)
 	return strings.Join(sa, "\n") == strings.Join(sb, "\n")
+}
+
+// ---------------------------------------------------------------------------
+// Selection persistence — remembers which tracks were checked so an
+// interrupted run can be resumed without re-selecting everything.
+// ---------------------------------------------------------------------------
+
+// SaveSelection replaces the saved selection with the given source paths.
+// An empty slice clears the saved selection.
+func SaveSelection(srcPaths []string) error {
+	db, err := openCacheDB()
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec("DELETE FROM selection"); err != nil {
+		return err
+	}
+	stmt, err := tx.Prepare("INSERT OR IGNORE INTO selection (src_path) VALUES (?)")
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+	for _, p := range srcPaths {
+		if _, err := stmt.Exec(p); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// LoadSelection returns the previously saved selection as a set of source paths.
+// Returns nil if there is no cache or no saved selection.
+func LoadSelection() (map[string]bool, error) {
+	dbPath, err := cacheDBPath()
+	if err != nil {
+		return nil, nil
+	}
+	if _, err := os.Stat(dbPath); err != nil {
+		return nil, nil // no cache file
+	}
+
+	db, err := openCacheDB()
+	if err != nil {
+		return nil, nil
+	}
+	defer db.Close()
+
+	rows, err := db.Query("SELECT src_path FROM selection")
+	if err != nil {
+		return nil, nil
+	}
+	defer rows.Close()
+
+	paths := make(map[string]bool)
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			return nil, nil
+		}
+		paths[p] = true
+	}
+	if len(paths) == 0 {
+		return nil, nil
+	}
+	return paths, nil
 }
