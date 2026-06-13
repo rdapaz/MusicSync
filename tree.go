@@ -383,6 +383,33 @@ func (m *TreeModel) SelectedTracks() []*Track {
 	return out
 }
 
+// SelectedPaths returns the source paths of all selected tracks, for persistence.
+func (m *TreeModel) SelectedPaths() []string {
+	out := make([]string, 0, len(m.selected))
+	for t := range m.selected {
+		out = append(out, t.SrcPath)
+	}
+	return out
+}
+
+// RestoreSelection marks every track whose source path is in the given set as
+// selected. Paths no longer present in the library are ignored. Budget limits
+// are intentionally not enforced here — we restore exactly what was saved and
+// let the budget bar reflect any overage. Returns the number of tracks selected.
+func (m *TreeModel) RestoreSelection(paths map[string]bool) int {
+	if m.lib == nil || len(paths) == 0 {
+		return 0
+	}
+	n := 0
+	for _, t := range m.lib.Tracks {
+		if paths[t.SrcPath] {
+			m.selected[t] = true
+			n++
+		}
+	}
+	return n
+}
+
 // SelectedTrackCount returns the number of selected tracks.
 func (m *TreeModel) SelectedTrackCount() int {
 	return len(m.selected)

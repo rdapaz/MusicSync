@@ -408,7 +408,10 @@ func CopyTracks(ctx context.Context, tracks []*Track, dstRoot string, workers in
 					atomic.AddInt64(&bytesDone, t.Size)
 					continue
 				}
-				if cerr := copyFile(t); cerr != nil {
+				if cerr := copyFile(ctx, t); cerr != nil {
+					if ctx.Err() != nil {
+						return // cancelled — not a real failure
+					}
 					atomic.AddUint64(&fail, 1)
 					continue
 				}
@@ -453,11 +456,12 @@ func CopyTracks(ctx context.Context, tracks []*Track, dstRoot string, workers in
 		}()
 	}
 
+feed:
 	for _, t := range tracks {
 		select {
 		case jobs <- t:
 		case <-ctx.Done():
-			break
+			break feed // labelled: a bare break would only exit the select
 		}
 	}
 	close(jobs)
@@ -467,7 +471,19 @@ func CopyTracks(ctx context.Context, tracks []*Track, dstRoot string, workers in
 	return int(ok), int(skip), int(fail), ctx.Err()
 }
 
-func copyFile(t *Track) error {
+// copyChunkSize is the buffer used per read/write during a copy. A large buffer
+// minimises SMB round-trips when reading from the NAS over the 2.5 Gbps link and
+// keeps writes to the single-channel micro-SD card large and sequential.
+const copyChunkSize = 4 << 20 // 4 MiB
+
+var copyBufPool = sync.Pool{
+	New: func() interface{} {
+		b := make([]byte, copyChunkSize)
+		return &b
+	},
+}
+
+func copyFile(ctx context.Context, t *Track) error {
 	if err := os.MkdirAll(t.DstDir, 0o755); err != nil {
 		return err
 	}
@@ -481,12 +497,40 @@ func copyFile(t *Track) error {
 	if err != nil {
 		return err
 	}
-	defer out.Close()
 
-	if _, err := io.Copy(out, in); err != nil {
-		return err
+	bufp := copyBufPool.Get().(*[]byte)
+	defer copyBufPool.Put(bufp)
+	buf := *bufp
+
+	for {
+		// Honour cancellation between chunks so a Cancel click is observed
+		// within one buffer's worth of I/O, not after the whole file.
+		if cerr := ctx.Err(); cerr != nil {
+			out.Close()
+			os.Remove(t.DstPath) // discard the partial file
+			return cerr
+		}
+		n, rerr := in.Read(buf)
+		if n > 0 {
+			if _, werr := out.Write(buf[:n]); werr != nil {
+				out.Close()
+				return werr
+			}
+		}
+		if rerr == io.EOF {
+			break
+		}
+		if rerr != nil {
+			out.Close()
+			return rerr
+		}
 	}
-	return out.Sync()
+
+	// No per-file fsync. Flushing every file to flash forces the card's
+	// controller to commit and garbage-collect constantly, which dominates
+	// runtime on micro-SD. Close hands the data to the OS; ejecting the card
+	// ("Safely Remove Hardware") guarantees the final flush to the device.
+	return out.Close()
 }
 
 // ---------------------------------------------------------------------------
